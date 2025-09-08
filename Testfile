@@ -1,33 +1,44 @@
-# requirements: boto3, pandas
-import os, time
+# lambda_function.py
+# Runtime: Python 3.11 (or 3.10). Needs boto3 (preinstalled in Lambda) + pandas (via a Lambda layer).
+
+import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 import concurrent.futures as cf
+import json
 
 import boto3
 import pandas as pd
 
-# ---- Configure via env or constants ----
-WORKGROUP   = os.environ["REDSHIFT_WORKGROUP"]   # e.g., "rs-workgroup-xyz"
-DATABASE    = os.environ["REDSHIFT_DATABASE"]    # e.g., "dev"
-SECRET_ARN  = os.environ["REDSHIFT_SECRET_ARN"]  # Secrets Manager ARN with DB creds
-MAX_CONC    = int(os.getenv("MAX_CONCURRENCY", "6"))
-POLL_SECS   = float(os.getenv("POLL_INTERVAL", "0.4"))
+# --------- CONFIG via environment variables ----------
+WORKGROUP    = os.environ["REDSHIFT_WORKGROUP"]     # e.g., "rs-serverless-workgroup-xyz"
+DATABASE     = os.environ["REDSHIFT_DATABASE"]      # e.g., "dev"
+SECRET_ARN   = os.environ["REDSHIFT_SECRET_ARN"]    # Secrets Manager ARN for DB creds
+MAX_CONC     = int(os.getenv("MAX_CONCURRENCY", "6"))
+POLL_INTERVAL= float(os.getenv("POLL_INTERVAL", "0.4"))
 STMT_DEADLINE_S = int(os.getenv("STMT_DEADLINE_S", "120"))
+# Optional S3 sink for large results
+RESULTS_S3_BUCKET = os.getenv("RESULTS_S3_BUCKET")  # e.g., "my-bucket" (optional)
+RESULTS_S3_PREFIX = os.getenv("RESULTS_S3_PREFIX", "redshift-data-api/results")  # optional
+RETURN_ROWS_LIMIT = int(os.getenv("RETURN_ROWS_LIMIT", "500"))  # cap rows returned inline
+# -----------------------------------------------------
 
 rsd = boto3.client("redshift-data")
+s3  = boto3.client("s3")
 
 # ---------- helpers ----------
 def _param(name: str, v: Any) -> Dict[str, Any]:
-    if v is None:           return {"name": name, "isNull": True}
-    if isinstance(v, bool): return {"name": name, "booleanValue": v}
-    if isinstance(v, int):  return {"name": name, "longValue": v}
-    if isinstance(v, float):return {"name": name, "doubleValue": v}
+    if v is None:            return {"name": name, "isNull": True}
+    if isinstance(v, bool):  return {"name": name, "booleanValue": v}
+    if isinstance(v, int):   return {"name": name, "longValue": v}
+    if isinstance(v, float): return {"name": name, "doubleValue": v}
     return {"name": name, "stringValue": str(v)}
 
 def _cell_val(cell: Dict[str, Any]) -> Any:
     if cell.get("isNull"): return None
-    for k in ("longValue","doubleValue","booleanValue","stringValue"):
-        if k in cell: return cell[k]
+    for k in ("longValue", "doubleValue", "booleanValue", "stringValue"):
+        if k in cell:
+            return cell[k]
     return None
 
 def _submit(sql: str, params: Optional[Dict[str, Any]] = None) -> str:
@@ -38,7 +49,7 @@ def _submit(sql: str, params: Optional[Dict[str, Any]] = None) -> str:
 
 def _wait(stmt_id: str, deadline_s: int = STMT_DEADLINE_S) -> None:
     t0 = time.time()
-    sleep = POLL_SECS
+    sleep = POLL_INTERVAL
     while True:
         st = rsd.describe_statement(Id=stmt_id)
         s = st["Status"]
@@ -65,9 +76,6 @@ def _fetch_all(stmt_id: str) -> Tuple[List[str], List[List[Any]]]:
     return cols, rows
 
 def select_df(sql: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-    """
-    Runs ONE SELECT statement via Data API and returns a pandas DataFrame with column names.
-    """
     stmt_id = _submit(sql, params=params)
     _wait(stmt_id)
     cols, rows = _fetch_all(stmt_id)
@@ -87,14 +95,46 @@ def run_parallel_selects(jobs: List[Dict[str, Any]], max_concurrency: int = MAX_
             out[name] = df
     return out
 
-# ------------- example -------------
-if __name__ == "__main__":
-    jobs = [
+def _df_to_s3_csv(df: pd.DataFrame, key: str) -> str:
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    s3.put_object(Bucket=RESULTS_S3_BUCKET, Key=key, Body=csv_bytes, ContentType="text/csv")
+    return f"s3://{RESULTS_S3_BUCKET}/{key}"
+
+# --------------- Lambda entrypoint -----------------
+def lambda_handler(event, context):
+    """
+    event example:
+    {
+      "jobs": [
         {"name": "users_top2", "sql": "SELECT id, name, created_at FROM public.users ORDER BY id LIMIT 2"},
         {"name": "orders_top", "sql": "SELECT user_id, COUNT(*) AS orders FROM public.orders GROUP BY 1 ORDER BY 2 DESC LIMIT 5"},
         {"name": "now",        "sql": "SELECT current_timestamp AS ts_utc"}
-    ]
-    dfs = run_parallel_selects(jobs, max_concurrency=6)
-    for k, v in dfs.items():
-        print(f"\n[{k}]")
-        print(v)
+      ]
+    }
+    """
+    jobs = event.get("jobs") or []
+    if not jobs:
+        # Minimal demo if no payload is provided
+        jobs = [{"name": "now", "sql": "SELECT current_timestamp AS ts_utc"}]
+
+    # run in parallel
+    dfs = run_parallel_selects(jobs, max_concurrency=MAX_CONC)
+
+    # build response: small results inline, larger to S3 if configured
+    response: Dict[str, Any] = {"results": {}, "stored": {}}
+    for name, df in dfs.items():
+        if RESULTS_S3_BUCKET and len(df) > RETURN_ROWS_LIMIT:
+            key = f"{RESULTS_S3_PREFIX}/{name}-{int(time.time())}.csv"
+            uri = _df_to_s3_csv(df, key)
+            response["stored"][name] = {"s3_uri": uri, "rows": len(df), "columns": list(df.columns)}
+        else:
+            # inline (list of dicts) – easy to consume by callers
+            response["results"][name] = {
+                "columns": list(df.columns),
+                "rows": df.to_dict(orient="records")
+            }
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(response, default=str)
+    }
