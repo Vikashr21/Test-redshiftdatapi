@@ -1,69 +1,55 @@
 # lambda_function.py
-# Runtime: Python 3.11 (or 3.10). Needs boto3 (preinstalled in Lambda) + pandas (via a Lambda layer).
+# Runtime: Python 3.11 (or 3.10). Needs boto3 (already in Lambda) + pandas (via a Lambda layer).
 
-import os
-import time
-from typing import Any, Dict, List, Optional, Tuple
-import concurrent.futures as cf
-import json
-
+import os, time, concurrent.futures as cf
 import boto3
 import pandas as pd
 
-# --------- CONFIG via environment variables ----------
-WORKGROUP    = os.environ["REDSHIFT_WORKGROUP"]     # e.g., "rs-serverless-workgroup-xyz"
-DATABASE     = os.environ["REDSHIFT_DATABASE"]      # e.g., "dev"
-SECRET_ARN   = os.environ["REDSHIFT_SECRET_ARN"]    # Secrets Manager ARN for DB creds
-MAX_CONC     = int(os.getenv("MAX_CONCURRENCY", "6"))
-POLL_INTERVAL= float(os.getenv("POLL_INTERVAL", "0.4"))
+# --- Env vars (configure in Lambda console) ---
+WORKGROUP   = os.environ["REDSHIFT_WORKGROUP"]
+DATABASE    = os.environ["REDSHIFT_DATABASE"]
+SECRET_ARN  = os.environ["REDSHIFT_SECRET_ARN"]
+MAX_CONC    = int(os.getenv("MAX_CONCURRENCY", "4"))  # tune based on RPU
+POLL_SECS   = float(os.getenv("POLL_INTERVAL", "0.5"))
 STMT_DEADLINE_S = int(os.getenv("STMT_DEADLINE_S", "120"))
-# Optional S3 sink for large results
-RESULTS_S3_BUCKET = os.getenv("RESULTS_S3_BUCKET")  # e.g., "my-bucket" (optional)
-RESULTS_S3_PREFIX = os.getenv("RESULTS_S3_PREFIX", "redshift-data-api/results")  # optional
-RETURN_ROWS_LIMIT = int(os.getenv("RETURN_ROWS_LIMIT", "500"))  # cap rows returned inline
-# -----------------------------------------------------
+# ----------------------------------------------
 
 rsd = boto3.client("redshift-data")
-s3  = boto3.client("s3")
 
 # ---------- helpers ----------
-def _param(name: str, v: Any) -> Dict[str, Any]:
-    if v is None:            return {"name": name, "isNull": True}
-    if isinstance(v, bool):  return {"name": name, "booleanValue": v}
-    if isinstance(v, int):   return {"name": name, "longValue": v}
+def _param(name, v):
+    if v is None: return {"name": name, "isNull": True}
+    if isinstance(v, bool): return {"name": name, "booleanValue": v}
+    if isinstance(v, int): return {"name": name, "longValue": v}
     if isinstance(v, float): return {"name": name, "doubleValue": v}
     return {"name": name, "stringValue": str(v)}
 
-def _cell_val(cell: Dict[str, Any]) -> Any:
+def _cell_val(cell):
     if cell.get("isNull"): return None
-    for k in ("longValue", "doubleValue", "booleanValue", "stringValue"):
-        if k in cell:
-            return cell[k]
+    for k in ("longValue","doubleValue","booleanValue","stringValue"):
+        if k in cell: return cell[k]
     return None
 
-def _submit(sql: str, params: Optional[Dict[str, Any]] = None) -> str:
+def _submit(sql, params=None):
     args = dict(WorkgroupName=WORKGROUP, Database=DATABASE, Sql=sql, WithEvent=True)
     if SECRET_ARN: args["SecretArn"] = SECRET_ARN
-    if params:     args["Parameters"] = [_param(k, v) for k, v in params.items()]
+    if params: args["Parameters"] = [_param(k, v) for k, v in params.items()]
     return rsd.execute_statement(**args)["Id"]
 
-def _wait(stmt_id: str, deadline_s: int = STMT_DEADLINE_S) -> None:
+def _wait(stmt_id, deadline_s=STMT_DEADLINE_S):
     t0 = time.time()
-    sleep = POLL_INTERVAL
     while True:
         st = rsd.describe_statement(Id=stmt_id)
-        s = st["Status"]
-        if s in ("FINISHED","FAILED","ABORTED"):
-            if s != "FINISHED":
-                raise RuntimeError(f"{s}: {st.get('Error')}")
+        if st["Status"] in ("FINISHED","FAILED","ABORTED"):
+            if st["Status"] != "FINISHED":
+                raise RuntimeError(f"{st['Status']}: {st.get('Error')}")
             return
         if time.time() - t0 > deadline_s:
-            try: rsd.cancel_statement(Id=stmt_id)
-            finally: raise TimeoutError(f"Timed out waiting for {stmt_id}")
-        time.sleep(sleep)
-        sleep = min(1.0, sleep * 1.2)
+            rsd.cancel_statement(Id=stmt_id)
+            raise TimeoutError(f"Timed out waiting for {stmt_id}")
+        time.sleep(POLL_SECS)
 
-def _fetch_all(stmt_id: str) -> Tuple[List[str], List[List[Any]]]:
+def _fetch_all(stmt_id):
     cols, rows, token = [], [], None
     while True:
         page = rsd.get_statement_result(Id=stmt_id, NextToken=token) if token else rsd.get_statement_result(Id=stmt_id)
@@ -73,20 +59,19 @@ def _fetch_all(stmt_id: str) -> Tuple[List[str], List[List[Any]]]:
             rows.append([_cell_val(c) for c in rec])
         token = page.get("NextToken")
         if not token: break
-    return cols, rows
-
-def select_df(sql: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-    stmt_id = _submit(sql, params=params)
-    _wait(stmt_id)
-    cols, rows = _fetch_all(stmt_id)
     return pd.DataFrame(rows, columns=cols)
 
-def run_parallel_selects(jobs: List[Dict[str, Any]], max_concurrency: int = MAX_CONC) -> Dict[str, pd.DataFrame]:
+def select_df(sql, params=None):
+    stmt_id = _submit(sql, params=params)
+    _wait(stmt_id)
+    return _fetch_all(stmt_id)
+
+def run_parallel_selects(jobs, max_concurrency=MAX_CONC):
     """
-    jobs: list of {"name": str, "sql": str, "params": Optional[dict]}
-    returns: {name: DataFrame}
+    jobs = [{"name": "q1", "sql": "SELECT ..."}, ...]
+    Returns {name: DataFrame}
     """
-    out: Dict[str, pd.DataFrame] = {}
+    out = {}
     def _one(job): return job["name"], select_df(job["sql"], job.get("params"))
     with cf.ThreadPoolExecutor(max_workers=max_concurrency) as pool:
         futs = {pool.submit(_one, j): j for j in jobs}
@@ -95,46 +80,29 @@ def run_parallel_selects(jobs: List[Dict[str, Any]], max_concurrency: int = MAX_
             out[name] = df
     return out
 
-def _df_to_s3_csv(df: pd.DataFrame, key: str) -> str:
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    s3.put_object(Bucket=RESULTS_S3_BUCKET, Key=key, Body=csv_bytes, ContentType="text/csv")
-    return f"s3://{RESULTS_S3_BUCKET}/{key}"
-
-# --------------- Lambda entrypoint -----------------
+# -------- Lambda entry --------
 def lambda_handler(event, context):
     """
-    event example:
+    Event example:
     {
       "jobs": [
-        {"name": "users_top2", "sql": "SELECT id, name, created_at FROM public.users ORDER BY id LIMIT 2"},
+        {"name": "users_top2", "sql": "SELECT id, name FROM public.users LIMIT 2"},
         {"name": "orders_top", "sql": "SELECT user_id, COUNT(*) AS orders FROM public.orders GROUP BY 1 ORDER BY 2 DESC LIMIT 5"},
-        {"name": "now",        "sql": "SELECT current_timestamp AS ts_utc"}
+        {"name": "now", "sql": "SELECT current_timestamp AS ts_utc"}
       ]
     }
     """
     jobs = event.get("jobs") or []
     if not jobs:
-        # Minimal demo if no payload is provided
         jobs = [{"name": "now", "sql": "SELECT current_timestamp AS ts_utc"}]
 
-    # run in parallel
-    dfs = run_parallel_selects(jobs, max_concurrency=MAX_CONC)
+    dfs = run_parallel_selects(jobs)
 
-    # build response: small results inline, larger to S3 if configured
-    response: Dict[str, Any] = {"results": {}, "stored": {}}
+    # Print each DataFrame (goes to CloudWatch logs)
     for name, df in dfs.items():
-        if RESULTS_S3_BUCKET and len(df) > RETURN_ROWS_LIMIT:
-            key = f"{RESULTS_S3_PREFIX}/{name}-{int(time.time())}.csv"
-            uri = _df_to_s3_csv(df, key)
-            response["stored"][name] = {"s3_uri": uri, "rows": len(df), "columns": list(df.columns)}
-        else:
-            # inline (list of dicts) – easy to consume by callers
-            response["results"][name] = {
-                "columns": list(df.columns),
-                "rows": df.to_dict(orient="records")
-            }
+        print(f"\n=== {name} ===")
+        print(df)
 
-    return {
-        "statusCode": 200,
-        "body": json.dumps(response, default=str)
-    }
+    # Optionally return the results inline (as JSON serializable)
+    result = {name: df.to_dict(orient="records") for name, df in dfs.items()}
+    return {"statusCode": 200, "body": result}
