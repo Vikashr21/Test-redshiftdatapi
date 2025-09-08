@@ -1,0 +1,201 @@
+import os
+import time
+import math
+from typing import Any, Dict, List, Optional, Tuple
+import concurrent.futures as cf
+
+import boto3
+import pandas as pd
+
+# --------- CONFIG ---------
+WORKGROUP = os.environ["REDSHIFT_WORKGROUP"]   # e.g., "rswlm-xxxx"
+DATABASE  = os.environ["REDSHIFT_DATABASE"]    # e.g., "dev"
+SECRET_ARN = os.environ["REDSHIFT_SECRET_ARN"] # Secrets Manager with creds
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "6"))  # tune: start 4-6
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.4"))  # seconds
+STATEMENT_DEADLINE_S = int(os.getenv("STATEMENT_DEADLINE_S", "120"))  # per statement
+# --------------------------
+
+rsd = boto3.client("redshift-data")
+
+# ---- Utilities: parameter typing & cell value decoding ----
+def _param(k: str, v: Any) -> Dict[str, Any]:
+    """Best-effort Data API parameter typer."""
+    if v is None:
+        return {"name": k, "isNull": True}
+    if isinstance(v, bool):
+        return {"name": k, "booleanValue": v}
+    if isinstance(v, int) and not isinstance(v, bool):
+        return {"name": k, "longValue": v}
+    if isinstance(v, float):
+        return {"name": k, "doubleValue": v}
+    # fallback: string
+    return {"name": k, "stringValue": str(v)}
+
+def _cell_value(cell: Dict[str, Any]) -> Any:
+    """Extract Python value from a Data API cell."""
+    if "isNull" in cell and cell["isNull"]:
+        return None
+    for key in ("longValue", "doubleValue", "booleanValue", "stringValue"):
+        if key in cell:
+            return cell[key]
+    # If Redshift returns other types in future, default to None/string
+    return cell.get("stringValue")
+
+# ---- Core: submit, wait, fetch (paged), to-DataFrame ----
+def submit_statement(sql: str,
+                     params: Optional[Dict[str, Any]] = None,
+                     tx_id: Optional[str] = None) -> str:
+    args = dict(
+        WorkgroupName=WORKGROUP,
+        Database=DATABASE,
+        Sql=sql,
+        WithEvent=True,
+    )
+    if SECRET_ARN:
+        args["SecretArn"] = SECRET_ARN
+    if params:
+        args["Parameters"] = [_param(k, v) for k, v in params.items()]
+    if tx_id:
+        args["TransactionId"] = tx_id
+    resp = rsd.execute_statement(**args)
+    return resp["Id"]
+
+def wait_for_statement(stmt_id: str, deadline_s: int = STATEMENT_DEADLINE_S) -> Dict[str, Any]:
+    t0 = time.time()
+    sleep = POLL_INTERVAL
+    while True:
+        st = rsd.describe_statement(Id=stmt_id)
+        s = st["Status"]
+        if s in ("FINISHED", "FAILED", "ABORTED"):
+            if s != "FINISHED":
+                # Attach error for caller
+                raise RuntimeError(f"{s}: {st.get('Error')}")
+            return st
+        if time.time() - t0 > deadline_s:
+            try:
+                rsd.cancel_statement(Id=stmt_id)
+            except Exception:
+                pass
+            raise TimeoutError(f"Timed out waiting for statement {stmt_id}")
+        time.sleep(sleep)
+        # gentle backoff up to ~1s
+        sleep = min(1.0, sleep * 1.2)
+
+def fetch_all_pages(stmt_id: str) -> Tuple[List[str], List[List[Any]]]:
+    """Return (columns, rows) where rows are lists aligned to columns."""
+    token = None
+    columns: List[str] = []
+    rows: List[List[Any]] = []
+    while True:
+        page = rsd.get_statement_result(Id=stmt_id, NextToken=token) if token else rsd.get_statement_result(Id=stmt_id)
+        if not columns:
+            columns = [c["name"] for c in page["ColumnMetadata"]]
+        for rec in page["Records"]:
+            rows.append([_cell_value(c) for c in rec])
+        token = page.get("NextToken")
+        if not token:
+            break
+    return columns, rows
+
+def select_to_dataframe(sql: str,
+                        params: Optional[Dict[str, Any]] = None,
+                        set_session: Optional[List[str]] = None,
+                        tx: bool = False) -> pd.DataFrame:
+    """
+    Runs a SELECT and returns a DataFrame with column names.
+    If you need session SETs (timezone, search_path) or temp tables, set tx=True and pass set_session statements.
+    """
+    tx_id = None
+    try:
+        if tx:
+            tx_id = rsd.begin_transaction(WorkgroupName=WORKGROUP, Database=DATABASE)["TransactionId"]
+
+        # Optional session SETs (e.g., timezone/search_path/datestyle) inside the same session/tx
+        if set_session:
+            for s in set_session:
+                sid = submit_statement(s, tx_id=tx_id)
+                wait_for_statement(sid)
+
+        stmt_id = submit_statement(sql, params=params, tx_id=tx_id)
+        wait_for_statement(stmt_id)
+        cols, rows = fetch_all_pages(stmt_id)
+        return pd.DataFrame(rows, columns=cols)
+    finally:
+        if tx_id:
+            # Best-effort commit; you can switch to rollback on exceptions if desired
+            try:
+                rsd.commit_transaction(WorkgroupName=WORKGROUP, Database=DATABASE, TransactionId=tx_id)
+            except Exception:
+                # If commit fails due to earlier raise, attempt rollback
+                try:
+                    rsd.rollback_transaction(WorkgroupName=WORKGROUP, Database=DATABASE, TransactionId=tx_id)
+                except Exception:
+                    pass
+
+# ---- Parallel runner for many independent SELECTs ----
+def run_parallel_selects(jobs: List[Dict[str, Any]],
+                         max_concurrency: int = MAX_CONCURRENCY) -> Dict[str, pd.DataFrame]:
+    """
+    jobs: list of dicts, each with:
+      - name: unique key for the result
+      - sql: SELECT text
+      - params: optional dict for parameters
+      - set_session: optional list of SET statements
+      - tx: bool, set True if job needs a session (e.g., SETs/temp tables)
+    Returns: {name: DataFrame}
+    """
+    results: Dict[str, pd.DataFrame] = {}
+    errors: Dict[str, str] = {}
+
+    def _one(job):
+        df = select_to_dataframe(job["sql"],
+                                 params=job.get("params"),
+                                 set_session=job.get("set_session"),
+                                 tx=job.get("tx", False))
+        return job["name"], df
+
+    with cf.ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+        futs = {pool.submit(_one, j): j for j in jobs}
+        for fut, job in futs.items():
+            pass
+        for fut in cf.as_completed(futs):
+            job = futs[fut]
+            try:
+                name, df = fut.result()
+                results[name] = df
+            except Exception as e:
+                errors[job["name"]] = str(e)
+
+    if errors:
+        # Surface all errors; you can choose to raise instead
+        raise RuntimeError(f"Some queries failed: {errors}")
+    return results
+
+# ===================== EXAMPLE USAGE =====================
+if __name__ == "__main__":
+    # Example: three independent SELECTs in parallel
+    jobs = [
+        {
+            "name": "users_top2",
+            "sql": "SELECT id, name, created_at FROM users ORDER BY id LIMIT 2",
+            # Optional: enforce consistent tz/search_path
+            "set_session": ["SET TIME ZONE 'Asia/Kolkata'", "SET search_path = public"],
+            "tx": True  # because we used SETs; they need the same session
+        },
+        {
+            "name": "orders_cnt",
+            "sql": "SELECT user_id, COUNT(*) AS orders FROM orders GROUP BY 1 ORDER BY 2 DESC LIMIT 5"
+        },
+        {
+            "name": "now_utc_and_ist",
+            "sql": "SELECT current_timestamp AS ts_utc"
+        },
+    ]
+
+    dfs = run_parallel_selects(jobs, max_concurrency=6)
+
+    # Access DataFrames by name
+    print(dfs["users_top2"].head())
+    print(dfs["orders_cnt"])
+    print(dfs["now_utc_and_ist"])
